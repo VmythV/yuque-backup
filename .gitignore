@@ -1,0 +1,7 @@
+/target/
+/backup/
+/yuque-backup.toml
+.env
+.env.*
+*.part
+.DS_Store

@@ -1,0 +1,21 @@
+host = "https://yuque.com"
+output_dir = "./backup"
+
+[auth]
+cookie_key = "_yuque_session"
+cookie_env = "YUQUE_COOKIE"
+token_env = "YUQUE_TOKEN"
+
+[rate_limit]
+api_requests_per_hour = 600
+api_concurrency = 1
+minimum_interval_ms = 1500
+asset_concurrency = 3
+asset_minimum_interval_ms = 200
+reserve_ratio = 0.15
+
+[sync]
+download_images = true
+download_attachments = true
+keep_raw = true
+render_markdown = true

@@ -1,0 +1,10 @@
+pub mod archive;
+pub mod cli;
+pub mod config;
+pub mod downloader;
+pub mod models;
+pub mod provider;
+pub mod rate_limit;
+pub mod resume;
+pub mod state;
+pub mod tui;
