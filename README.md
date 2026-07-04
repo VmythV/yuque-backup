@@ -18,7 +18,33 @@
 - 对疑似思维导图 / 画板文档保存请求层 `diagramData`
 - 临时文件原子写入、失败记录和归档检查
 
-## 构建
+## 下载预编译可执行文件
+
+当前 Release 提供 macOS Apple Silicon 版本：
+
+```bash
+curl -L -o yuque-backup-v0.1.0-aarch64-apple-darwin.tar.gz \
+  https://github.com/VmythV/yuque-downloader/releases/download/v0.1.0/yuque-backup-v0.1.0-aarch64-apple-darwin.tar.gz
+
+tar -xzf yuque-backup-v0.1.0-aarch64-apple-darwin.tar.gz
+chmod +x yuque-backup
+```
+
+可选：移动到 PATH 中：
+
+```bash
+sudo mv yuque-backup /usr/local/bin/yuque-backup
+```
+
+如果 macOS 提示无法打开未签名程序，可以执行：
+
+```bash
+xattr -d com.apple.quarantine ./yuque-backup
+```
+
+如果没有移动到 PATH，后续命令用 `./yuque-backup`；如果已经移动到 PATH，直接用 `yuque-backup`。
+
+## 从源码构建
 
 ```bash
 cargo build --release
@@ -27,13 +53,13 @@ cargo build --release
 ## 初始化
 
 ```bash
-./target/release/yuque-backup init --host https://yuque.com
+yuque-backup init --host https://yuque.com
 ```
 
 也可以使用其他空间：
 
 ```bash
-./target/release/yuque-backup --host https://example.yuque.com tui
+yuque-backup --host https://example.yuque.com tui
 ```
 
 Host 的优先级为：
