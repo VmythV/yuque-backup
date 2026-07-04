@@ -24,7 +24,7 @@
 
 ```bash
 curl -L -o yuque-backup-v0.1.0-aarch64-apple-darwin.tar.gz \
-  https://github.com/VmythV/yuque-downloader/releases/download/v0.1.0/yuque-backup-v0.1.0-aarch64-apple-darwin.tar.gz
+  https://github.com/VmythV/yuque-backup/releases/download/v0.1.0/yuque-backup-v0.1.0-aarch64-apple-darwin.tar.gz
 
 tar -xzf yuque-backup-v0.1.0-aarch64-apple-darwin.tar.gz
 chmod +x yuque-backup
