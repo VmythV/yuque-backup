@@ -107,6 +107,10 @@ fn run_selection(
                                     .fg(Color::Yellow)
                                     .add_modifier(Modifier::BOLD),
                             ),
+                            Span::styled(
+                                format!(" [{}]", team.kind.as_str()),
+                                Style::default().fg(Color::Cyan),
+                            ),
                             Span::raw(format!("  {selected}/{}", team.repositories.len())),
                         ]))
                     }
