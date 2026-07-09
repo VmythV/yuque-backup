@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     time::Duration,
 };
 
@@ -193,6 +193,8 @@ impl YuqueProvider for CookieProvider {
             .into_values()
             .filter(|team| !team.repositories.is_empty())
             .collect();
+        dedupe_repositories_across_teams(&mut result);
+        result.retain(|team| !team.repositories.is_empty());
         for team in &mut result {
             team.repositories.sort_by(|a, b| a.name.cmp(&b.name));
         }
@@ -328,6 +330,26 @@ impl YuqueProvider for CookieProvider {
             raw,
             diagram_raw,
         })
+    }
+}
+
+fn dedupe_repositories_across_teams(teams: &mut [Team]) {
+    let mut team_order = (0..teams.len()).collect::<Vec<_>>();
+    team_order.sort_by_key(|index| team_kind_priority(&teams[*index].kind));
+
+    let mut seen = HashSet::new();
+    for index in team_order {
+        teams[index]
+            .repositories
+            .retain(|repo| seen.insert(repo.id.clone()));
+    }
+}
+
+fn team_kind_priority(kind: &TeamKind) -> u8 {
+    match kind {
+        TeamKind::Group => 0,
+        TeamKind::Collaboration => 1,
+        TeamKind::Personal => 2,
     }
 }
 
@@ -483,5 +505,40 @@ mod tests {
         let html = r#"<script>window.appData=JSON.parse(decodeURIComponent("%7B%22book%22%3A%7B%22toc%22%3A%5B%5D%7D%7D"));</script>"#;
         let parsed = parse_app_data(html).unwrap();
         assert!(parsed.pointer("/book/toc").unwrap().is_array());
+    }
+
+    #[test]
+    fn dedupes_repositories_across_team_kinds() {
+        let repo = Repository {
+            id: "repo-1".into(),
+            slug: "repo".into(),
+            name: "Repo".into(),
+            namespace: "team/repo".into(),
+            owner_login: "team".into(),
+            description: None,
+            items_count: None,
+            selected: false,
+        };
+        let mut teams = vec![
+            Team {
+                id: "personal".into(),
+                login: "team".into(),
+                name: "Team".into(),
+                kind: TeamKind::Personal,
+                repositories: vec![repo.clone()],
+            },
+            Team {
+                id: "group".into(),
+                login: "team".into(),
+                name: "Team".into(),
+                kind: TeamKind::Group,
+                repositories: vec![repo],
+            },
+        ];
+
+        dedupe_repositories_across_teams(&mut teams);
+
+        assert!(teams[0].repositories.is_empty());
+        assert_eq!(teams[1].repositories.len(), 1);
     }
 }

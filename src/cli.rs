@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     io::{self, IsTerminal},
     path::{Path, PathBuf},
@@ -14,7 +15,7 @@ use time::{OffsetDateTime, UtcOffset};
 use crate::{
     config::AppConfig,
     downloader::Downloader,
-    models::{SyncEvent, Team},
+    models::{Repository, SyncEvent, Team},
     provider::{CookieProvider, YuqueProvider},
     rate_limit::RateLimitCallback,
     state::{StateStore, now_epoch_ms},
@@ -117,10 +118,10 @@ pub async fn run(cli: Cli, config: AppConfig) -> Result<()> {
                     if !select_repositories(&config.host, &mut teams, &state)? {
                         return Ok(());
                     }
-                    persist_selections(&config.host, &teams, &state)?;
                     if !has_selected_repository(&teams) {
                         bail!("没有选择任何知识库，请至少选择一个知识库后再开始同步");
                     }
+                    persist_selections(&config.host, &teams, &state)?;
                     if select_only {
                         return Ok(());
                     }
@@ -372,8 +373,21 @@ fn has_selected_repository(teams: &[Team]) -> bool {
 }
 
 fn persist_selections(host: &str, teams: &[Team], state: &StateStore) -> Result<()> {
-    for repo in teams.iter().flat_map(|t| &t.repositories) {
-        state.set_selection(host, repo, repo.selected)?;
+    let mut repositories: BTreeMap<&str, (&Repository, bool)> = BTreeMap::new();
+    for repo in teams.iter().flat_map(|team| &team.repositories) {
+        repositories
+            .entry(repo.id.as_str())
+            .and_modify(|entry| {
+                if repo.selected {
+                    entry.0 = repo;
+                }
+                entry.1 = entry.1 || repo.selected;
+            })
+            .or_insert((repo, repo.selected));
+    }
+
+    for (_, (repo, selected)) in repositories {
+        state.set_selection(host, repo, selected)?;
     }
     Ok(())
 }

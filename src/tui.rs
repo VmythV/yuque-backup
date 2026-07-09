@@ -66,12 +66,16 @@ pub fn show_startup_rate_limit_wait(
 
 pub fn select_repositories(host: &str, teams: &mut [Team], state: &StateStore) -> Result<bool> {
     let previous: HashSet<_> = state.selected_repo_ids(host)?.into_iter().collect();
+    let progress = state.repository_progress_by_host(host)?;
     for team in teams.iter_mut() {
         for repo in &mut team.repositories {
-            repo.selected = previous.contains(&repo.id);
+            repo.selected = previous.contains(&repo.id)
+                || progress
+                    .get(&repo.id)
+                    .map(|summary| summary.needs_resume())
+                    .unwrap_or(false);
         }
     }
-    let progress = state.repository_progress_by_host(host)?;
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -156,7 +160,7 @@ fn run_startup_rate_limit_wait(
             frame.render_widget(
                 Gauge::default()
                     .block(Block::default().borders(Borders::ALL).title("等待进度"))
-                    .gauge_style(Style::default().fg(Color::Cyan))
+                    .gauge_style(Style::default().fg(Color::Cyan).bg(Color::Black))
                     .ratio(ratio)
                     .label(format!("剩余 {}", current.remaining)),
                 chunks[1],
@@ -260,16 +264,28 @@ fn run_selection(
                                 format!(" [{}]", team.kind.as_str()),
                                 Style::default().fg(Color::Cyan),
                             ),
-                            Span::raw(format!("  {selected}/{}", team.repositories.len())),
+                            Span::raw(format!("  本次 {selected}/{}  ", team.repositories.len())),
+                            Span::styled(
+                                team_history_label(team, progress),
+                                team_history_style(team, progress),
+                            ),
                         ]))
                     }
                     Row::Repository(team_index, repo_index) => {
                         let repo = &teams[team_index].repositories[repo_index];
                         let marker = if repo.selected { "[x]" } else { "[ ]" };
                         ListItem::new(Line::from(vec![
-                            Span::raw(format!("    {marker} {}", repo.name)),
                             Span::styled(
-                                format!("  {}", repository_progress_label(repo, progress)),
+                                format!("    {marker} "),
+                                selection_marker_style(repo.selected),
+                            ),
+                            Span::styled(
+                                repository_history_badge(repo, progress),
+                                repository_progress_style(progress.get(&repo.id)),
+                            ),
+                            Span::raw(format!(" {}", repo.name)),
+                            Span::styled(
+                                format!("  {}", repository_progress_detail(repo, progress)),
                                 repository_progress_style(progress.get(&repo.id)),
                             ),
                         ]))
@@ -496,6 +512,132 @@ fn append_resume_section(
     rows.append(&mut items);
 }
 
+fn selection_marker_style(selected: bool) -> Style {
+    if selected {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    }
+}
+
+fn team_history_label(
+    team: &Team,
+    progress: &HashMap<String, RepositoryProgressSummary>,
+) -> String {
+    let total = team.repositories.len();
+    let mut completed = 0;
+    let mut resumable = 0;
+    let mut started = 0;
+
+    for repo in &team.repositories {
+        let Some(summary) = progress.get(&repo.id).copied() else {
+            continue;
+        };
+        if summary.is_started() {
+            started += 1;
+        }
+        if summary.is_complete() {
+            completed += 1;
+        } else if summary.needs_resume() {
+            resumable += 1;
+        }
+    }
+
+    let not_started = total.saturating_sub(started);
+    if total > 0 && completed == total {
+        "历史 全部完成".to_string()
+    } else if started == 0 {
+        "历史 未开始".to_string()
+    } else {
+        let mut parts = Vec::new();
+        if completed > 0 {
+            parts.push(format!("{completed} 完成"));
+        }
+        if resumable > 0 {
+            parts.push(format!("{resumable} 待继续"));
+        }
+        if not_started > 0 {
+            parts.push(format!("{not_started} 未开始"));
+        }
+        format!("历史 {}", parts.join("，"))
+    }
+}
+
+fn team_history_style(team: &Team, progress: &HashMap<String, RepositoryProgressSummary>) -> Style {
+    let mut started = 0;
+    let mut completed = 0;
+    let mut resumable = 0;
+    for repo in &team.repositories {
+        let Some(summary) = progress.get(&repo.id).copied() else {
+            continue;
+        };
+        if summary.is_started() {
+            started += 1;
+        }
+        if summary.is_complete() {
+            completed += 1;
+        } else if summary.needs_resume() {
+            resumable += 1;
+        }
+    }
+
+    if !team.repositories.is_empty() && completed == team.repositories.len() {
+        Style::default().fg(Color::Green)
+    } else if resumable > 0 {
+        Style::default().fg(Color::Yellow)
+    } else if started > 0 {
+        Style::default().fg(Color::Green)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    }
+}
+
+fn repository_history_badge(
+    repo: &Repository,
+    progress: &HashMap<String, RepositoryProgressSummary>,
+) -> String {
+    match progress.get(&repo.id).copied() {
+        Some(summary) if summary.is_complete() => "[已完成]".to_string(),
+        Some(summary) if summary.needs_resume() => "[待继续]".to_string(),
+        Some(_) => "[有记录]".to_string(),
+        None => "[未开始]".to_string(),
+    }
+}
+
+fn repository_progress_detail(
+    repo: &Repository,
+    progress: &HashMap<String, RepositoryProgressSummary>,
+) -> String {
+    match progress.get(&repo.id).copied() {
+        Some(summary) if summary.is_complete() => {
+            format!(
+                "{}/{}",
+                summary.completed_documents, summary.total_documents
+            )
+        }
+        Some(summary) if summary.is_started() => {
+            let mut parts = vec![format!(
+                "{}/{}",
+                summary.completed_documents, summary.total_documents
+            )];
+            parts.push(format!("待处理 {}", summary.pending_documents()));
+            if summary.failed_documents > 0 {
+                parts.push(format!("失败 {}", summary.failed_documents));
+            }
+            if summary.in_progress_documents > 0 {
+                parts.push(format!("中断 {}", summary.in_progress_documents));
+            }
+            parts.join("，")
+        }
+        _ => repo
+            .items_count
+            .map(|count| format!("约 {count} 项"))
+            .unwrap_or_default(),
+    }
+}
+
 fn repository_progress_label(
     repo: &Repository,
     progress: &HashMap<String, RepositoryProgressSummary>,
@@ -549,13 +691,25 @@ fn toggle_row(row: &Row, teams: &mut [Team]) {
     match *row {
         Row::Team(index) => {
             let selected = teams[index].repositories.iter().all(|r| r.selected);
-            teams[index]
+            let repo_ids = teams[index]
                 .repositories
+                .iter()
+                .map(|repo| repo.id.clone())
+                .collect::<HashSet<_>>();
+            teams
                 .iter_mut()
-                .for_each(|r| r.selected = !selected);
+                .flat_map(|team| &mut team.repositories)
+                .filter(|repo| repo_ids.contains(&repo.id))
+                .for_each(|repo| repo.selected = !selected);
         }
         Row::Repository(team, repo) => {
-            teams[team].repositories[repo].selected = !teams[team].repositories[repo].selected
+            let repo_id = teams[team].repositories[repo].id.clone();
+            let selected = !teams[team].repositories[repo].selected;
+            teams
+                .iter_mut()
+                .flat_map(|team| &mut team.repositories)
+                .filter(|repo| repo.id == repo_id)
+                .for_each(|repo| repo.selected = selected);
         }
     }
 }
@@ -662,7 +816,7 @@ fn run_progress(
             frame.render_widget(
                 Gauge::default()
                     .block(Block::default().borders(Borders::ALL).title("整体进度"))
-                    .gauge_style(Style::default().fg(Color::Cyan))
+                    .gauge_style(Style::default().fg(Color::Cyan).bg(Color::Black))
                     .ratio(overall_ratio)
                     .label(overall_label),
                 chunks[1],

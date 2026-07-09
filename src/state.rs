@@ -515,7 +515,51 @@ impl StateStore {
                     },
                 ))
             })?;
-            Ok(rows.collect::<rusqlite::Result<HashMap<_, _>>>()?)
+            let mut progress = rows.collect::<rusqlite::Result<HashMap<_, _>>>()?;
+
+            let mut stmt = conn.prepare(
+                "SELECT rb.repo_id,
+                        rs.doc_count,
+                        rb.name,
+                        rb.cardinality
+                 FROM resume_bitmaps rb
+                 JOIN resume_snapshots rs
+                   ON rs.host=rb.host
+                  AND rs.repo_id=rb.repo_id
+                  AND rs.snapshot_hash=rb.snapshot_hash
+                 JOIN (
+                    SELECT host, repo_id, MAX(updated_at) AS updated_at
+                    FROM resume_snapshots
+                    WHERE host=?1
+                    GROUP BY host, repo_id
+                 ) latest
+                   ON latest.host=rs.host
+                  AND latest.repo_id=rs.repo_id
+                  AND latest.updated_at=rs.updated_at
+                 WHERE rb.host=?1
+                   AND rb.name IN ('done', 'failed')",
+            )?;
+            let rows = stmt.query_map([host], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)? as u64,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)? as u64,
+                ))
+            })?;
+
+            for row in rows {
+                let (repo_id, doc_count, name, cardinality) = row?;
+                let entry = progress.entry(repo_id).or_default();
+                entry.total_documents = entry.total_documents.max(doc_count);
+                match name.as_str() {
+                    "done" => entry.completed_documents = cardinality,
+                    "failed" => entry.failed_documents = cardinality,
+                    _ => {}
+                }
+            }
+
+            Ok(progress)
         })
     }
 
@@ -794,6 +838,94 @@ mod tests {
         assert_eq!(repo.completed_documents, 1);
         assert_eq!(repo.failed_documents, 1);
         assert_eq!(repo.in_progress_documents, 1);
+        assert_eq!(repo.pending_documents(), 2);
+        assert!(repo.needs_resume());
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn repository_progress_prefers_resume_bitmap_totals() {
+        let dir = std::env::temp_dir().join(format!(
+            "yuque-progress-resume-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = StateStore::open(dir.join("state.sqlite3")).unwrap();
+
+        let doc = DocumentPayload {
+            doc_id: "doc-complete".into(),
+            slug: "doc-complete".into(),
+            title: "Complete".into(),
+            updated_at: None,
+            content_updated_at: None,
+            markdown: None,
+            body_html: None,
+            body_lake: None,
+            sheet: None,
+            raw: serde_json::Value::Null,
+            diagram_raw: None,
+        };
+        state
+            .upsert_document(
+                "https://a.yuque.com",
+                "repo-1",
+                &doc,
+                DocumentStateUpdate::stage(JobStage::Complete),
+            )
+            .unwrap();
+        state
+            .save_resume_bitmaps(
+                "https://a.yuque.com",
+                "repo-1",
+                "snapshot-1",
+                3,
+                &[
+                    ResumeItemWrite {
+                        ordinal: 0,
+                        doc_id: "doc-complete".into(),
+                        slug: "doc-complete".into(),
+                        title: "Complete".into(),
+                        remote_updated_at: None,
+                    },
+                    ResumeItemWrite {
+                        ordinal: 1,
+                        doc_id: "doc-pending-1".into(),
+                        slug: "doc-pending-1".into(),
+                        title: "Pending 1".into(),
+                        remote_updated_at: None,
+                    },
+                    ResumeItemWrite {
+                        ordinal: 2,
+                        doc_id: "doc-pending-2".into(),
+                        slug: "doc-pending-2".into(),
+                        title: "Pending 2".into(),
+                        remote_updated_at: None,
+                    },
+                ],
+                &[
+                    ResumeBitmapWrite {
+                        name: "done".into(),
+                        encoding: "dense-v1".into(),
+                        cardinality: 1,
+                        blob: vec![0b0000_0001],
+                    },
+                    ResumeBitmapWrite {
+                        name: "failed".into(),
+                        encoding: "dense-v1".into(),
+                        cardinality: 0,
+                        blob: vec![0],
+                    },
+                ],
+            )
+            .unwrap();
+
+        let progress = state
+            .repository_progress_by_host("https://a.yuque.com")
+            .unwrap();
+        let repo = progress.get("repo-1").unwrap();
+        assert_eq!(repo.total_documents, 3);
+        assert_eq!(repo.completed_documents, 1);
         assert_eq!(repo.pending_documents(), 2);
         assert!(repo.needs_resume());
 
