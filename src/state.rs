@@ -24,6 +24,33 @@ pub struct StatusSummary {
     pub failed_documents: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RepositoryProgressSummary {
+    pub total_documents: u64,
+    pub completed_documents: u64,
+    pub failed_documents: u64,
+    pub in_progress_documents: u64,
+}
+
+impl RepositoryProgressSummary {
+    pub fn pending_documents(self) -> u64 {
+        self.total_documents
+            .saturating_sub(self.completed_documents)
+    }
+
+    pub fn is_started(self) -> bool {
+        self.total_documents > 0
+    }
+
+    pub fn is_complete(self) -> bool {
+        self.is_started() && self.pending_documents() == 0 && self.failed_documents == 0
+    }
+
+    pub fn needs_resume(self) -> bool {
+        self.is_started() && self.pending_documents() > 0
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct DocumentStateUpdate<'a> {
     pub stage: JobStage,
@@ -462,6 +489,36 @@ impl StateStore {
         })
     }
 
+    pub fn repository_progress_by_host(
+        &self,
+        host: &str,
+    ) -> Result<HashMap<String, RepositoryProgressSummary>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT repo_id,
+                        COUNT(*),
+                        SUM(CASE WHEN stage='complete' THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN stage='failed' THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN stage NOT IN ('complete', 'failed') THEN 1 ELSE 0 END)
+                 FROM documents
+                 WHERE host=?1
+                 GROUP BY repo_id",
+            )?;
+            let rows = stmt.query_map([host], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    RepositoryProgressSummary {
+                        total_documents: row.get::<_, i64>(1)? as u64,
+                        completed_documents: row.get::<_, i64>(2)? as u64,
+                        failed_documents: row.get::<_, i64>(3)? as u64,
+                        in_progress_documents: row.get::<_, i64>(4)? as u64,
+                    },
+                ))
+            })?;
+            Ok(rows.collect::<rusqlite::Result<HashMap<_, _>>>()?)
+        })
+    }
+
     pub fn reconcile_remote_documents(
         &self,
         host: &str,
@@ -669,6 +726,77 @@ mod tests {
             loaded.remote_updated_at.as_deref(),
             Some("2026-01-02T00:00:00Z")
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn summarizes_repository_progress_by_host() {
+        let dir =
+            std::env::temp_dir().join(format!("yuque-progress-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = StateStore::open(dir.join("state.sqlite3")).unwrap();
+
+        for (doc_id, stage) in [
+            ("doc-complete", JobStage::Complete),
+            ("doc-failed", JobStage::Failed),
+            ("doc-running", JobStage::AssetsDownloading),
+        ] {
+            let doc = DocumentPayload {
+                doc_id: doc_id.into(),
+                slug: doc_id.into(),
+                title: doc_id.into(),
+                updated_at: None,
+                content_updated_at: None,
+                markdown: None,
+                body_html: None,
+                body_lake: None,
+                sheet: None,
+                raw: serde_json::Value::Null,
+                diagram_raw: None,
+            };
+            state
+                .upsert_document(
+                    "https://a.yuque.com",
+                    "repo-1",
+                    &doc,
+                    DocumentStateUpdate::stage(stage),
+                )
+                .unwrap();
+        }
+
+        let other = DocumentPayload {
+            doc_id: "doc-other".into(),
+            slug: "doc-other".into(),
+            title: "Other".into(),
+            updated_at: None,
+            content_updated_at: None,
+            markdown: None,
+            body_html: None,
+            body_lake: None,
+            sheet: None,
+            raw: serde_json::Value::Null,
+            diagram_raw: None,
+        };
+        state
+            .upsert_document(
+                "https://b.yuque.com",
+                "repo-1",
+                &other,
+                DocumentStateUpdate::stage(JobStage::Complete),
+            )
+            .unwrap();
+
+        let progress = state
+            .repository_progress_by_host("https://a.yuque.com")
+            .unwrap();
+        let repo = progress.get("repo-1").unwrap();
+        assert_eq!(repo.total_documents, 3);
+        assert_eq!(repo.completed_documents, 1);
+        assert_eq!(repo.failed_documents, 1);
+        assert_eq!(repo.in_progress_documents, 1);
+        assert_eq!(repo.pending_documents(), 2);
+        assert!(repo.needs_resume());
+
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

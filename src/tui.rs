@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     io,
     sync::mpsc::{Receiver, TryRecvError},
     time::Duration,
@@ -23,8 +23,8 @@ use ratatui::{
 use ratatui::widgets::Gauge;
 
 use crate::{
-    models::{RateLimitProgress, SyncEvent, SyncProgress, SyncSummary, Team},
-    state::{StateStore, now_epoch_ms},
+    models::{RateLimitProgress, Repository, SyncEvent, SyncProgress, SyncSummary, Team},
+    state::{RepositoryProgressSummary, StateStore, now_epoch_ms},
 };
 
 #[derive(Debug, Clone)]
@@ -40,6 +40,7 @@ pub fn select_repositories(host: &str, teams: &mut [Team], state: &StateStore) -
             repo.selected = previous.contains(&repo.id);
         }
     }
+    let progress = state.repository_progress_by_host(host)?;
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -47,7 +48,32 @@ pub fn select_repositories(host: &str, teams: &mut [Team], state: &StateStore) -
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
-    let result = run_selection(&mut terminal, host, teams);
+    let result = run_selection(&mut terminal, host, teams, &progress);
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+    result
+}
+
+pub fn confirm_resume(host: &str, teams: &[Team], state: &StateStore) -> Result<bool> {
+    let progress = state.repository_progress_by_host(host)?;
+    let has_unfinished = teams
+        .iter()
+        .flat_map(|team| &team.repositories)
+        .filter(|repo| repo.selected)
+        .filter_map(|repo| progress.get(&repo.id))
+        .any(|summary| summary.needs_resume());
+    if !has_unfinished {
+        return Ok(true);
+    }
+
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
+    let result = run_resume_confirmation(&mut terminal, host, teams, &progress);
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
@@ -58,6 +84,7 @@ fn run_selection(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     host: &str,
     teams: &mut [Team],
+    progress: &HashMap<String, RepositoryProgressSummary>,
 ) -> Result<bool> {
     let rows = build_rows(teams);
     let mut list_state = ListState::default().with_selected(Some(0));
@@ -117,11 +144,13 @@ fn run_selection(
                     Row::Repository(team_index, repo_index) => {
                         let repo = &teams[team_index].repositories[repo_index];
                         let marker = if repo.selected { "[x]" } else { "[ ]" };
-                        let count = repo
-                            .items_count
-                            .map(|v| format!(" 约 {v} 项"))
-                            .unwrap_or_default();
-                        ListItem::new(format!("    {marker} {}{count}", repo.name))
+                        ListItem::new(Line::from(vec![
+                            Span::raw(format!("    {marker} {}", repo.name)),
+                            Span::styled(
+                                format!("  {}", repository_progress_label(repo, progress)),
+                                repository_progress_style(progress.get(&repo.id)),
+                            ),
+                        ]))
                     }
                 })
                 .collect();
@@ -192,6 +221,194 @@ fn run_selection(
                 _ => {}
             }
         }
+    }
+}
+
+fn run_resume_confirmation(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    host: &str,
+    teams: &[Team],
+    progress: &HashMap<String, RepositoryProgressSummary>,
+) -> Result<bool> {
+    let rows = build_resume_confirmation_rows(teams, progress);
+    if rows.is_empty() {
+        return Ok(true);
+    }
+    let mut list_state = ListState::default().with_selected(Some(0));
+    loop {
+        terminal.draw(|frame| {
+            let area = frame.area();
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Min(5),
+                    Constraint::Length(3),
+                ])
+                .split(area);
+
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(
+                        "检测到上次同步记录  ",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(host),
+                ]))
+                .block(Block::default().borders(Borders::ALL).title("继续同步")),
+                chunks[0],
+            );
+
+            let items = rows
+                .iter()
+                .map(|row| match row {
+                    ResumeConfirmRow::Section(title) => ListItem::new(Line::from(Span::styled(
+                        title.clone(),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ))),
+                    ResumeConfirmRow::Repository {
+                        name,
+                        detail,
+                        style,
+                    } => ListItem::new(Line::from(vec![
+                        Span::raw(format!("  {name}  ")),
+                        Span::styled(detail.clone(), *style),
+                    ])),
+                })
+                .collect::<Vec<_>>();
+            let list = List::new(items)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("所选知识库进度"),
+                )
+                .highlight_style(Style::default().bg(Color::DarkGray))
+                .highlight_symbol("▶ ");
+            frame.render_stateful_widget(list, chunks[1], &mut list_state);
+
+            frame.render_widget(
+                Paragraph::new("Enter 继续断点同步    ↑/↓ 查看    q/Esc 退出")
+                    .block(Block::default().borders(Borders::ALL).title("操作")),
+                chunks[2],
+            );
+        })?;
+
+        if event::poll(Duration::from_millis(250))?
+            && let Event::Key(key) = event::read()?
+        {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            let current = list_state.selected().unwrap_or(0);
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    list_state.select(Some(current.saturating_sub(1)))
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    list_state.select(Some((current + 1).min(rows.len().saturating_sub(1))))
+                }
+                KeyCode::Enter => return Ok(true),
+                KeyCode::Char('q') | KeyCode::Esc => return Ok(false),
+                _ => {}
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum ResumeConfirmRow {
+    Section(String),
+    Repository {
+        name: String,
+        detail: String,
+        style: Style,
+    },
+}
+
+fn build_resume_confirmation_rows(
+    teams: &[Team],
+    progress: &HashMap<String, RepositoryProgressSummary>,
+) -> Vec<ResumeConfirmRow> {
+    let mut completed = Vec::new();
+    let mut pending = Vec::new();
+    let mut not_started = Vec::new();
+
+    for repo in teams
+        .iter()
+        .flat_map(|team| &team.repositories)
+        .filter(|repo| repo.selected)
+    {
+        let summary = progress.get(&repo.id).copied();
+        let row = ResumeConfirmRow::Repository {
+            name: repo.name.clone(),
+            detail: repository_progress_label(repo, progress),
+            style: repository_progress_style(summary.as_ref()),
+        };
+        match summary {
+            Some(item) if item.is_complete() => completed.push(row),
+            Some(item) if item.is_started() => pending.push(row),
+            _ => not_started.push(row),
+        }
+    }
+
+    let mut rows = Vec::new();
+    append_resume_section(&mut rows, "已完成", completed);
+    append_resume_section(&mut rows, "待继续", pending);
+    append_resume_section(&mut rows, "未开始", not_started);
+    rows
+}
+
+fn append_resume_section(
+    rows: &mut Vec<ResumeConfirmRow>,
+    title: &str,
+    mut items: Vec<ResumeConfirmRow>,
+) {
+    if items.is_empty() {
+        return;
+    }
+    rows.push(ResumeConfirmRow::Section(title.to_string()));
+    rows.append(&mut items);
+}
+
+fn repository_progress_label(
+    repo: &Repository,
+    progress: &HashMap<String, RepositoryProgressSummary>,
+) -> String {
+    match progress.get(&repo.id).copied() {
+        Some(summary) if summary.is_complete() => format!(
+            "{}/{} 已完成",
+            summary.completed_documents, summary.total_documents
+        ),
+        Some(summary) if summary.is_started() => {
+            let mut parts = vec![format!(
+                "{}/{} 待继续",
+                summary.completed_documents, summary.total_documents
+            )];
+            parts.push(format!("待处理 {}", summary.pending_documents()));
+            if summary.failed_documents > 0 {
+                parts.push(format!("失败 {}", summary.failed_documents));
+            }
+            if summary.in_progress_documents > 0 {
+                parts.push(format!("中断 {}", summary.in_progress_documents));
+            }
+            parts.join("，")
+        }
+        _ => repo
+            .items_count
+            .map(|count| format!("未开始，约 {count} 项"))
+            .unwrap_or_else(|| "未开始".to_string()),
+    }
+}
+
+fn repository_progress_style(progress: Option<&RepositoryProgressSummary>) -> Style {
+    match progress.copied() {
+        Some(summary) if summary.is_complete() => Style::default().fg(Color::Green),
+        Some(summary) if summary.needs_resume() => Style::default().fg(Color::Yellow),
+        _ => Style::default().fg(Color::DarkGray),
     }
 }
 

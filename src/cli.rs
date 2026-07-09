@@ -14,7 +14,7 @@ use crate::{
     provider::{CookieProvider, YuqueProvider},
     rate_limit::RateLimitCallback,
     state::{StateStore, now_epoch_ms},
-    tui::{select_repositories, show_sync_progress},
+    tui::{confirm_resume, select_repositories, show_sync_progress},
 };
 
 #[derive(Debug, Parser)]
@@ -113,6 +113,9 @@ pub async fn run(cli: Cli, config: AppConfig) -> Result<()> {
                     if select_only {
                         return Ok(());
                     }
+                    if !confirm_resume(&config.host, &teams, &state)? {
+                        return Ok(());
+                    }
                     sync_selected(config, state, provider, teams, true).await
                 }
                 Command::Sync { all } => {
@@ -137,6 +140,7 @@ pub async fn run(cli: Cli, config: AppConfig) -> Result<()> {
                     {
                         bail!("没有已选知识库，请先运行 yuque-backup tui");
                     }
+                    print_resume_notice(&config.host, &teams, &state)?;
                     sync_selected(config, state, provider, teams, false).await
                 }
                 _ => unreachable!(),
@@ -285,6 +289,42 @@ fn persist_selections(host: &str, teams: &[Team], state: &StateStore) -> Result<
     for repo in teams.iter().flat_map(|t| &t.repositories) {
         state.set_selection(host, repo, repo.selected)?;
     }
+    Ok(())
+}
+
+fn print_resume_notice(host: &str, teams: &[Team], state: &StateStore) -> Result<()> {
+    let progress = state.repository_progress_by_host(host)?;
+    let mut repo_count = 0_u64;
+    let mut total = 0_u64;
+    let mut completed = 0_u64;
+    let mut failed = 0_u64;
+    let mut in_progress = 0_u64;
+
+    for repo in teams
+        .iter()
+        .flat_map(|team| &team.repositories)
+        .filter(|repo| repo.selected)
+    {
+        let Some(summary) = progress.get(&repo.id).copied() else {
+            continue;
+        };
+        if !summary.needs_resume() {
+            continue;
+        }
+        repo_count += 1;
+        total += summary.total_documents;
+        completed += summary.completed_documents;
+        failed += summary.failed_documents;
+        in_progress += summary.in_progress_documents;
+    }
+
+    if repo_count > 0 {
+        let pending = total.saturating_sub(completed);
+        println!(
+            "检测到上次同步未完成：{repo_count} 个知识库待继续，已完成 {completed}/{total}，待处理 {pending}，失败 {failed}，中断 {in_progress}。将自动从断点继续。"
+        );
+    }
+
     Ok(())
 }
 
