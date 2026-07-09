@@ -28,9 +28,40 @@ use crate::{
 };
 
 #[derive(Debug, Clone)]
+pub struct StartupWaitSnapshot {
+    pub used: usize,
+    pub usable: usize,
+    pub current_time: String,
+    pub resume_time: String,
+    pub remaining: String,
+    pub remaining_seconds: i64,
+}
+
+#[derive(Debug, Clone)]
 enum Row {
     Team(usize),
     Repository(usize, usize),
+}
+
+pub fn show_startup_rate_limit_wait(
+    host: &str,
+    mut snapshot: impl FnMut() -> Result<Option<StartupWaitSnapshot>>,
+) -> Result<bool> {
+    let Some(initial) = snapshot()? else {
+        return Ok(true);
+    };
+
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
+    let result = run_startup_rate_limit_wait(&mut terminal, host, initial, snapshot);
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+    result
 }
 
 pub fn select_repositories(host: &str, teams: &mut [Team], state: &StateStore) -> Result<bool> {
@@ -78,6 +109,97 @@ pub fn confirm_resume(host: &str, teams: &[Team], state: &StateStore) -> Result<
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     result
+}
+
+fn run_startup_rate_limit_wait(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    host: &str,
+    initial: StartupWaitSnapshot,
+    mut snapshot: impl FnMut() -> Result<Option<StartupWaitSnapshot>>,
+) -> Result<bool> {
+    let initial_seconds = initial.remaining_seconds.max(1);
+    let mut current = initial;
+    loop {
+        terminal.draw(|frame| {
+            let area = frame.area();
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Length(3),
+                    Constraint::Length(7),
+                    Constraint::Min(1),
+                    Constraint::Length(3),
+                ])
+                .split(area);
+
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(
+                        "API 限流等待  ",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(host),
+                ]))
+                .block(Block::default().borders(Borders::ALL).title("连接")),
+                chunks[0],
+            );
+
+            let elapsed = initial_seconds.saturating_sub(current.remaining_seconds);
+            let ratio = if initial_seconds == 0 {
+                1.0
+            } else {
+                (elapsed as f64 / initial_seconds as f64).clamp(0.0, 1.0)
+            };
+            frame.render_widget(
+                Gauge::default()
+                    .block(Block::default().borders(Borders::ALL).title("等待进度"))
+                    .gauge_style(Style::default().fg(Color::Cyan))
+                    .ratio(ratio)
+                    .label(format!("剩余 {}", current.remaining)),
+                chunks[1],
+            );
+
+            let details = vec![
+                Line::raw(format!(
+                    "过去一小时 API 用量: {}/{}",
+                    current.used, current.usable
+                )),
+                Line::raw(format!("当前时间: {}", current.current_time)),
+                Line::raw(format!("预计恢复: {}", current.resume_time)),
+                Line::raw(format!("剩余时间: {}", current.remaining)),
+                Line::raw("窗口恢复后会自动继续进入 TUI。"),
+            ];
+            frame.render_widget(
+                Paragraph::new(details).block(Block::default().borders(Borders::ALL).title("状态")),
+                chunks[2],
+            );
+
+            frame.render_widget(
+                Paragraph::new("q/Esc 退出")
+                    .block(Block::default().borders(Borders::ALL).title("操作")),
+                chunks[4],
+            );
+        })?;
+
+        if event::poll(Duration::from_secs(1))?
+            && let Event::Key(key) = event::read()?
+        {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
+                return Ok(false);
+            }
+        }
+
+        let Some(next) = snapshot()? else {
+            return Ok(true);
+        };
+        current = next;
+    }
 }
 
 fn run_selection(

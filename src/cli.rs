@@ -1,11 +1,15 @@
 use std::{
     fs,
+    io::{self, IsTerminal},
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+
+use time::{OffsetDateTime, UtcOffset};
 
 use crate::{
     config::AppConfig,
@@ -14,7 +18,10 @@ use crate::{
     provider::{CookieProvider, YuqueProvider},
     rate_limit::RateLimitCallback,
     state::{StateStore, now_epoch_ms},
-    tui::{confirm_resume, select_repositories, show_sync_progress},
+    tui::{
+        StartupWaitSnapshot, confirm_resume, select_repositories, show_startup_rate_limit_wait,
+        show_sync_progress,
+    },
 };
 
 #[derive(Debug, Parser)]
@@ -88,7 +95,11 @@ pub async fn run(cli: Cli, config: AppConfig) -> Result<()> {
         Command::Verify => verify(&config),
         command => {
             let state = StateStore::open(config.database_path())?;
-            warn_if_api_rate_limited(&config, &state)?;
+            let use_wait_screen =
+                matches!(&command, Command::Tui { .. }) && io::stdout().is_terminal();
+            if !wait_if_api_rate_limited(&config, &state, use_wait_screen).await? {
+                return Ok(());
+            }
             let provider = Arc::new(CookieProvider::new(config.clone(), state.clone())?);
             provider.validate_session().await?;
             match command {
@@ -149,29 +160,86 @@ pub async fn run(cli: Cli, config: AppConfig) -> Result<()> {
     }
 }
 
-fn warn_if_api_rate_limited(config: &AppConfig, state: &StateStore) -> Result<()> {
-    let now = now_epoch_ms();
-    let entries = state.request_window(&config.host, "api", now - 3_600_000)?;
+async fn wait_if_api_rate_limited(
+    config: &AppConfig,
+    state: &StateStore,
+    use_wait_screen: bool,
+) -> Result<bool> {
+    if use_wait_screen {
+        return show_startup_rate_limit_wait(&config.host, || {
+            api_rate_limit_wait_snapshot(config, state)
+        });
+    }
+
+    wait_if_api_rate_limited_text(config, state).await
+}
+
+async fn wait_if_api_rate_limited_text(config: &AppConfig, state: &StateStore) -> Result<bool> {
+    let mut printed = false;
+    let mut last_logged_remaining_seconds = None;
+
+    loop {
+        let Some(snapshot) = api_rate_limit_wait_snapshot(config, state)? else {
+            if printed {
+                eprintln!(
+                    "API 限流窗口已恢复：当前时间 {}，继续启动。",
+                    format_local_time(now_epoch_ms())
+                );
+            }
+            return Ok(true);
+        };
+
+        if should_log_limit_wait(last_logged_remaining_seconds, snapshot.remaining_seconds) {
+            eprintln!(
+                "API 限流窗口已满：过去一小时已用 {}/{} 次；当前时间 {}；预计 {} 恢复；剩余 {}。程序会继续等待，不是卡死。",
+                snapshot.used,
+                snapshot.usable,
+                snapshot.current_time,
+                snapshot.resume_time,
+                snapshot.remaining
+            );
+        }
+
+        printed = true;
+        last_logged_remaining_seconds = Some(snapshot.remaining_seconds);
+        let sleep_seconds = snapshot.remaining_seconds.clamp(1, 60) as u64;
+        tokio::time::sleep(Duration::from_secs(sleep_seconds)).await;
+    }
+}
+
+fn api_rate_limit_wait_snapshot(
+    config: &AppConfig,
+    state: &StateStore,
+) -> Result<Option<StartupWaitSnapshot>> {
     let usable = ((config.rate_limit.api_requests_per_hour as f64)
         * (1.0 - config.rate_limit.reserve_ratio))
         .floor()
         .max(1.0) as usize;
-
-    if entries.len() >= usable {
-        let wait_ms = entries
-            .first()
-            .map(|first| first + 3_600_000 - now + 250)
-            .unwrap_or(250)
-            .max(250);
-        eprintln!(
-            "API 限流窗口已满：过去一小时已用 {}/{} 次；预计还需 {} 释放额度。程序会继续等待，不是卡死。",
-            entries.len(),
-            usable,
-            format_wait_duration(wait_ms)
-        );
+    let now = now_epoch_ms();
+    let entries = state.request_window(&config.host, "api", now - 3_600_000)?;
+    if entries.len() < usable {
+        return Ok(None);
     }
+    let wait_ms = entries
+        .first()
+        .map(|first| first + 3_600_000 - now + 250)
+        .unwrap_or(250)
+        .max(250);
+    Ok(Some(StartupWaitSnapshot {
+        used: entries.len(),
+        usable,
+        current_time: format_local_time(now),
+        resume_time: format_local_time(now + wait_ms),
+        remaining: format_wait_duration(wait_ms),
+        remaining_seconds: ((wait_ms + 999) / 1000).max(1),
+    }))
+}
 
-    Ok(())
+fn should_log_limit_wait(previous: Option<i64>, current: i64) -> bool {
+    match previous {
+        None => true,
+        Some(previous) => previous / 60 != current / 60 || current <= 5,
+    }
 }
 
 fn format_wait_duration(ms: i64) -> String {
@@ -185,6 +253,24 @@ fn format_wait_duration(ms: i64) -> String {
     } else {
         format!("{minutes} 分 {seconds} 秒")
     }
+}
+
+fn format_local_time(ms: i64) -> String {
+    let seconds = ms.div_euclid(1_000);
+    let Ok(datetime) = OffsetDateTime::from_unix_timestamp(seconds) else {
+        return "-".into();
+    };
+    let offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
+    let local = datetime.to_offset(offset);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        local.year(),
+        u8::from(local.month()),
+        local.day(),
+        local.hour(),
+        local.minute(),
+        local.second()
+    )
 }
 
 async fn sync_selected(
